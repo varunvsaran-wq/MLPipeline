@@ -1,0 +1,15 @@
+# Demo target dataset: M5 Forecasting / Walmart sales (hierarchical).
+# https://www.kaggle.com/competitions/m5-forecasting-accuracy
+name: m5
+date_col: date
+target_col: sales
+series_id_cols:
+  - store_id
+  - item_id
+exogenous_cols:
+  - sell_price
+  - event_name_1
+  - snap_flag
+horizon: 28
+freq: D
+holiday_country: US

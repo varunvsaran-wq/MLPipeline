@@ -1,0 +1,13 @@
+# Phase 1 prototype dataset: Kaggle Avocado prices.
+# https://www.kaggle.com/datasets/neuromusic/avocado-prices
+name: avocado
+date_col: Date
+target_col: AveragePrice
+series_id_cols:
+  - region
+  - type
+exogenous_cols:
+  - "Total Volume"
+horizon: 28
+freq: W           # avocado data is weekly
+holiday_country: US
