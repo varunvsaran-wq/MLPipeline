@@ -17,6 +17,29 @@ CONFIG_DIR = Path(__file__).resolve().parent
 DATASETS_DIR = CONFIG_DIR / "datasets"
 
 
+class FourierTerm(BaseModel):
+    """One seasonal Fourier component: ``period`` base-frequency steps, ``order`` harmonics."""
+
+    period: float
+    order: int = 3
+
+
+class FeatureConfig(BaseModel):
+    """Tabular feature suite controls (Phase 2). All units are base-freq steps.
+
+    Defaults are daily-oriented (M5); the avocado config overrides with weekly
+    lags/windows so the same pipeline serves both datasets.
+    """
+
+    lags: list[int] = Field(default_factory=lambda: [1, 7, 14, 28])
+    rolling_windows: list[int] = Field(default_factory=lambda: [7, 28])
+    fourier: list[FourierTerm] = Field(default_factory=list)
+    # Lag (in base-freq steps) applied to exogenous regressors so only
+    # information available at forecast time leaks into features.
+    exogenous_lag: int = 1
+    use_exogenous: bool = True
+
+
 class DatasetConfig(BaseModel):
     """Schema for a single dataset definition."""
 
@@ -39,6 +62,8 @@ class DatasetConfig(BaseModel):
     # Default single series to use for the univariate baseline (Phase 1),
     # as {series_id_col: value}. Empty means the data is already univariate.
     default_series: dict[str, str] = Field(default_factory=dict)
+    # Tabular feature suite controls (Phase 2 / LightGBM).
+    features: FeatureConfig = Field(default_factory=FeatureConfig)
 
     @property
     def raw_filename(self) -> str:
@@ -57,4 +82,4 @@ class DatasetConfig(BaseModel):
         return cls(**data)
 
 
-__all__ = ["DatasetConfig", "CONFIG_DIR", "DATASETS_DIR"]
+__all__ = ["DatasetConfig", "FeatureConfig", "FourierTerm", "CONFIG_DIR", "DATASETS_DIR"]

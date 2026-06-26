@@ -13,3 +13,14 @@ exogenous_cols:
 horizon: 28
 freq: D
 holiday_country: US
+# Daily feature suite (matches HANDOFF: t-1/7/14/28 lags, 7/28-day rolling).
+features:
+  lags: [1, 7, 14, 28]
+  rolling_windows: [7, 28]
+  fourier:
+    - period: 7        # weekly seasonality
+      order: 3
+    - period: 365.25   # yearly seasonality
+      order: 6
+  exogenous_lag: 1
+  use_exogenous: true

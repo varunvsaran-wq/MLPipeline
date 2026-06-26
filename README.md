@@ -5,8 +5,8 @@ model is intentionally secondary — the infrastructure (data versioning,
 experiment tracking, model registry, serving, drift monitoring, CI/CD, and
 automated retraining) is the deliverable.
 
-> **Status:** Phase 1 complete (Avocado + Prophet baseline tracked in MLflow).
-> See the [phase plan](#phase-plan).
+> **Status:** Phase 2 complete (full feature suite + global LightGBM vs Prophet,
+> WMAPE/WRMSSE/pinball leaderboard). See the [phase plan](#phase-plan).
 
 ---
 
@@ -91,7 +91,7 @@ pytest -q
 |---|---|---|
 | 0 | Repo scaffold, DVC, MLflow+Postgres compose, empty pytest | ✅ done |
 | 1 | Avocado + Prophet baseline, MLflow run with WMAPE | ✅ done |
-| 2 | M5 migration, full feature suite, LightGBM, WMAPE/WRMSSE/pinball | ⬜ |
+| 2 | Full feature suite + LightGBM vs Prophet, WMAPE/WRMSSE/pinball | ✅ done¹ |
 | 3 | FastAPI serving, Docker, CI | ⬜ |
 | 4 | Registry promotion gate, TFT, ONNX | ⬜ |
 | 5 | Evidently drift signals + Streamlit ops dashboard | ⬜ |
@@ -100,25 +100,47 @@ pytest -q
 Each phase has acceptance criteria in `HANDOFF.md`; work stops for review at
 each gate.
 
-## Running Phase 1 (Avocado + Prophet)
+¹ Phase 2's feature suite + LightGBM + WMAPE/WRMSSE/pinball are built and run on
+the **Avocado panel** (108 series = 54 regions × 2 types). The dataset is
+swap-only — point `--dataset m5` at the M5 config once the Kaggle data is
+available (`config/datasets/m5.yaml` is wired with the daily feature suite).
+
+## Running the models
 
 ```bash
-pip install -e ".[dev,models]"     # Prophet etc.
+pip install -e ".[dev,models]"     # Prophet, LightGBM, etc.
 dvc pull                            # fetch the DVC-tracked avocado.csv
+
+# Phase 1: single-series Prophet baseline
 python -m models.prophet_baseline --dataset avocado
-#   -> logs a tracked run (params, WMAPE/bias, model artifact, git commit) to MLflow
+
+# Phase 2: full feature suite + global LightGBM vs Prophet, all metrics
+python -m models.run_comparison --dataset avocado
+#   -> nested MLflow runs (one per model) + models/leaderboard.md
 ```
 
-By default runs log to a local `mlruns/` store. To log to the docker-compose
-MLflow server instead, `export MLFLOW_TRACKING_URI=http://localhost:5000` first.
+Runs log to a local `mlruns/` store by default. To use the docker-compose MLflow
+server instead, `export MLFLOW_TRACKING_URI=http://localhost:5000` first.
+
+**Feature suite** (`config/datasets/*.yaml` → `features:`): target lags, rolling
+mean/std/min/max, calendar (month/week/quarter/weekend/holiday), Fourier
+seasonality, and lagged exogenous regressors. The global LightGBM forecasts the
+horizon **recursively** (each step's p50 is fed back as history) so lag/rolling
+features never peek at validation actuals.
 
 ## Model leaderboard
 
-Validation = last `horizon` weekly points held out per series. WRMSSE / pinball
-columns populate once Phase 2 (LightGBM on M5) lands.
+Avocado panel, validation = last 12 weekly points held out per series (108
+series). Lower is better for all columns except bias (closer to 0). WRMSSE
+weights series by dollar volume — an adaptation of the official M5 hierarchy
+weights for this dataset. Probabilistic forecasts are p10/p50/p90 (LightGBM
+quantile models; Prophet's 80% interval).
 
-| Model | Dataset | Series | WMAPE | Bias |
-|---|---|---|---:|---:|
-| Prophet | Avocado | TotalUS / conventional | 0.185 | +0.196 |
+| Model | WMAPE | WRMSSE | Pinball p10 | Pinball p50 | Pinball p90 | Bias |
+|---|---:|---:|---:|---:|---:|---:|
+| **LightGBM** (global) | **0.0848** | **1.0917** | **0.0296** | **0.0571** | 0.0286 | **−0.0123** |
+| Prophet (per series) | 0.1580 | 2.6642 | 0.0710 | 0.1064 | 0.0390 | +0.1655 |
 
-_Numbers regenerate from MLflow; see `models/prophet_baseline.py`._
+The feature-based global model roughly halves WMAPE and more than halves WRMSSE
+versus the per-series Prophet baseline. Numbers regenerate from MLflow; see
+`models/run_comparison.py` and `models/leaderboard.md`.

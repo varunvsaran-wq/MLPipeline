@@ -16,3 +16,12 @@ holiday_country: US
 default_series:
   region: TotalUS
   type: conventional
+# Phase 2 tabular feature suite. Units are weekly steps (freq: W).
+features:
+  lags: [1, 2, 3, 4, 8, 12, 52]
+  rolling_windows: [4, 8, 12, 52]
+  fourier:
+    - period: 52.143   # yearly seasonality on weekly data (365.25/7)
+      order: 4
+  exogenous_lag: 1
+  use_exogenous: true
