@@ -5,8 +5,8 @@ model is intentionally secondary — the infrastructure (data versioning,
 experiment tracking, model registry, serving, drift monitoring, CI/CD, and
 automated retraining) is the deliverable.
 
-> **Status:** Phase 0 complete (repo scaffold + tracking stack). See the
-> [phase plan](#phase-plan).
+> **Status:** Phase 1 complete (Avocado + Prophet baseline tracked in MLflow).
+> See the [phase plan](#phase-plan).
 
 ---
 
@@ -90,7 +90,7 @@ pytest -q
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Repo scaffold, DVC, MLflow+Postgres compose, empty pytest | ✅ done |
-| 1 | Avocado + Prophet baseline, MLflow run with WMAPE | ⬜ |
+| 1 | Avocado + Prophet baseline, MLflow run with WMAPE | ✅ done |
 | 2 | M5 migration, full feature suite, LightGBM, WMAPE/WRMSSE/pinball | ⬜ |
 | 3 | FastAPI serving, Docker, CI | ⬜ |
 | 4 | Registry promotion gate, TFT, ONNX | ⬜ |
@@ -100,7 +100,25 @@ pytest -q
 Each phase has acceptance criteria in `HANDOFF.md`; work stops for review at
 each gate.
 
+## Running Phase 1 (Avocado + Prophet)
+
+```bash
+pip install -e ".[dev,models]"     # Prophet etc.
+dvc pull                            # fetch the DVC-tracked avocado.csv
+python -m models.prophet_baseline --dataset avocado
+#   -> logs a tracked run (params, WMAPE/bias, model artifact, git commit) to MLflow
+```
+
+By default runs log to a local `mlruns/` store. To log to the docker-compose
+MLflow server instead, `export MLFLOW_TRACKING_URI=http://localhost:5000` first.
+
 ## Model leaderboard
 
-_Populated from MLflow once Phase 2 lands (Prophet vs LightGBM vs TFT across
-WMAPE / WRMSSE / pinball / bias)._
+Validation = last `horizon` weekly points held out per series. WRMSSE / pinball
+columns populate once Phase 2 (LightGBM on M5) lands.
+
+| Model | Dataset | Series | WMAPE | Bias |
+|---|---|---|---:|---:|
+| Prophet | Avocado | TotalUS / conventional | 0.185 | +0.196 |
+
+_Numbers regenerate from MLflow; see `models/prophet_baseline.py`._

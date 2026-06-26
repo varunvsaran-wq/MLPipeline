@@ -1,6 +1,7 @@
 # Phase 1 prototype dataset: Kaggle Avocado prices.
 # https://www.kaggle.com/datasets/neuromusic/avocado-prices
 name: avocado
+raw_file: avocado.csv
 date_col: Date
 target_col: AveragePrice
 series_id_cols:
@@ -8,6 +9,10 @@ series_id_cols:
   - type
 exogenous_cols:
   - "Total Volume"
-horizon: 28
-freq: W           # avocado data is weekly
+horizon: 12        # ~3 months of weekly points held out for validation
+freq: W            # avocado data is weekly
 holiday_country: US
+# Phase 1 univariate baseline operates on one clean weekly series.
+default_series:
+  region: TotalUS
+  type: conventional

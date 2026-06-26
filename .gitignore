@@ -21,9 +21,15 @@ mlruns/
 mlartifacts/
 
 # DVC-managed data (the .dvc pointer files ARE tracked; the data is not)
-/data/raw/
-/data/interim/
-/data/processed/
+/data/raw/*
+/data/interim/*
+/data/processed/*
+# ...but keep the DVC pointers, gitignore stubs, and dir placeholders
+!/data/raw/.gitkeep
+!/data/processed/.gitkeep
+!/data/raw/*.dvc
+!/data/interim/*.dvc
+!/data/processed/*.dvc
 *.parquet
 *.csv
 !tests/**/*.csv

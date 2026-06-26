@@ -1,0 +1,5 @@
+outs:
+- md5: 67af5fd8c4fa27cd1ba4aff5ffb650cb
+  size: 1989197
+  hash: md5
+  path: avocado.csv

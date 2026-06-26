@@ -34,6 +34,16 @@ class DatasetConfig(BaseModel):
     freq: str = "D"
     # ISO country code for the `holidays` library.
     holiday_country: str | None = None
+    # Raw file under data/raw/ (defaults to "<name>.csv" if unset).
+    raw_file: str | None = None
+    # Default single series to use for the univariate baseline (Phase 1),
+    # as {series_id_col: value}. Empty means the data is already univariate.
+    default_series: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def raw_filename(self) -> str:
+        """Resolved raw filename, defaulting to ``<name>.csv``."""
+        return self.raw_file or f"{self.name}.csv"
 
     @classmethod
     def load(cls, name: str) -> DatasetConfig:
