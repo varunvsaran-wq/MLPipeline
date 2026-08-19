@@ -1,0 +1,13 @@
+# Keep the build context (and final image) small and data-free.
+.venv/
+.git/
+mlruns/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# Data + built artifacts are mounted at runtime, never baked in.
+data/raw/*.csv
+models/artifacts/
+serving/*.db
+.env

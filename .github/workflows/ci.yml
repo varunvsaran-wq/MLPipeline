@@ -16,15 +16,45 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install dev dependencies
+      - name: Install dev + serving dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,serving]"
 
       - name: Lint (ruff)
         run: |
           ruff check .
           ruff format --check .
 
+      - name: Data validation
+        # Custom range/schema assertions; skips cleanly if DVC data is absent.
+        run: python -m data.validation --dataset avocado
+
       - name: Test (pytest)
+        # Integration tests self-skip when optional model deps / data are missing.
         run: pytest -q
+
+  docker-build-smoke:
+    # Build the serving image and assert /health returns 200 in the container.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build serving image
+        run: docker build -f docker/serving.Dockerfile -t demand-api:ci .
+
+      - name: Run container
+        run: |
+          docker run -d --name api -p 8000:8000 demand-api:ci
+          echo "waiting for /health ..."
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "health OK"; exit 0
+            fi
+            sleep 2
+          done
+          echo "health check failed; container logs:"; docker logs api; exit 1
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f api || true

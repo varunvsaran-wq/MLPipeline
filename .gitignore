@@ -20,6 +20,14 @@ htmlcov/
 mlruns/
 mlartifacts/
 
+# Serving build artifacts: the model bundle, ONNX exports and the prediction log
+# are rebuilt/regenerated (not source), so keep them out of git.
+models/artifacts/
+serving/*.db
+# Local SQLite MLflow store (the demo / offline runs create this).
+mlflow.db
+*.db-journal
+
 # DVC-managed data (the .dvc pointer files ARE tracked; the data is not)
 /data/raw/*
 /data/interim/*

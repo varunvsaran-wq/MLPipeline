@@ -1,0 +1,367 @@
+# Scheduled / drift-triggered retraining loop (Phase 6).
+#
+# Flow:
+#
+#   retrain job
+#     resolve inputs -> DVC pull (best effort) -> optional synthetic drift injection
+#       -> models.retrain (features -> all model families -> fixed holdout eval
+#          -> compare vs Production -> promote if it beats the threshold, archiving
+#          the incumbent)
+#       -> integration tests against the registry/serving stack
+#       -> upload leaderboard + retrain report artifacts
+#   notify job (always)
+#     -> job summary with the metrics diff + Slack message
+#
+# Triggers:
+#   * schedule           - weekly baseline retrain.
+#   * workflow_dispatch  - manual, with dataset / force / dry_run / inject_drift inputs.
+#   * repository_dispatch (type: drift-breach) - this is the "triggered by a drift
+#     breach" path: the monitoring job (or scripts/demo_self_heal.py) POSTs
+#     /repos/:owner/:repo/dispatches with {"event_type":"drift-breach"} and an
+#     optional client_payload {dataset, reason}.
+#
+# ---------------------------------------------------------------------------
+# Secrets / variables:
+#
+#   secrets.MLFLOW_TRACKING_URI - DB-backed tracking store. REQUIRED for a real
+#       registry comparison: models.registry raises RegistryUnsupportedError against
+#       a file:// / mlruns store, so the MLflow *model registry* cannot work there.
+#       When the secret is absent this workflow falls back to an ephemeral
+#       `sqlite:///$GITHUB_WORKSPACE/mlflow.db`, which is DB-backed (so the registry
+#       API works) but starts empty -- there is no incumbent, so models.promote will
+#       promote the first candidate unconditionally. That is a *self-contained smoke
+#       run of the retraining loop*, not a production promotion, and it is labelled
+#       as such in the job summary.
+#   secrets.SLACK_WEBHOOK_URL   - optional; passed through to models.retrain (which
+#       notifies itself) and used by the notify job for the metrics-diff message.
+#   vars.MODEL_NAME             - registered model name (default demand-forecasting-lgbm).
+#   vars.RETRAIN_THRESHOLD      - relative improvement required to promote (default 0.01).
+#   vars.RETRAIN_DATASET        - default dataset for scheduled runs (default avocado).
+# ---------------------------------------------------------------------------
+
+name: Retrain
+
+on:
+  schedule:
+    # 03:17 UTC every Monday. Off-the-hour so it is not queued behind the
+    # thundering herd of :00 cron jobs on GitHub's shared runners.
+    - cron: "17 3 * * 1"
+  repository_dispatch:
+    types: [drift-breach]
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset to retrain"
+        required: false
+        default: "avocado"
+      force:
+        description: "Retrain even if no drift breach is detected"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "Evaluate everything but do not write to the registry"
+        type: boolean
+        required: false
+        default: false
+      inject_drift:
+        description: "Run the synthetic demand-shock injection first"
+        type: boolean
+        required: false
+        default: false
+      threshold:
+        description: "Relative improvement required over Production (0.01 = 1%)"
+        required: false
+        default: ""
+
+# Never let two retrains race for the same registry model.
+concurrency:
+  group: retrain-${{ github.event.inputs.dataset || github.event.client_payload.dataset || 'avocado' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  retrain:
+    name: Retrain + evaluate + promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      dataset: ${{ steps.inputs.outputs.dataset }}
+      trigger: ${{ steps.inputs.outputs.trigger }}
+      registry_mode: ${{ steps.mlflow.outputs.mode }}
+      retrain_exit: ${{ steps.retrain.outputs.exit_code }}
+      retrain_status: ${{ steps.retrain.outputs.status }}
+      metrics_diff: ${{ steps.diff.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+          DATASET="${{ github.event.inputs.dataset || github.event.client_payload.dataset || vars.RETRAIN_DATASET || 'avocado' }}"
+          case "${{ github.event_name }}" in
+            schedule)            TRIGGER="schedule" ;;
+            repository_dispatch) TRIGGER="drift-breach" ;;
+            *)                   TRIGGER="manual" ;;
+          esac
+          # Scheduled runs force a retrain (there is no live drift signal in CI);
+          # drift-breach and manual runs let models.retrain decide unless forced.
+          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "$TRIGGER" = "schedule" ]; then
+            FORCE="--force"
+          else
+            FORCE=""
+          fi
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && DRY_RUN="--dry-run" || DRY_RUN=""
+          THRESHOLD="${{ github.event.inputs.threshold || vars.RETRAIN_THRESHOLD || '0.01' }}"
+          # Scheduled runs inject synthetic drift so the loop is exercised end to end.
+          if [ "${{ github.event.inputs.inject_drift }}" = "true" ] || [ "$TRIGGER" = "schedule" ]; then
+            INJECT="true"
+          else
+            INJECT="false"
+          fi
+          {
+            echo "dataset=${DATASET}"
+            echo "trigger=${TRIGGER}"
+            echo "force=${FORCE}"
+            echo "dry_run=${DRY_RUN}"
+            echo "threshold=${THRESHOLD}"
+            echo "inject=${INJECT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "dataset=${DATASET} trigger=${TRIGGER} force='${FORCE}' dry_run='${DRY_RUN}' threshold=${THRESHOLD} inject=${INJECT}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,models,serving,monitoring]"
+
+      - name: DVC pull (best effort)
+        # The default remote is a local path (.dvc/config -> ../../dvc-storage), which
+        # does not exist on a runner. A missing remote must not fail the retrain: the
+        # repo carries enough committed data for the loop to run.
+        run: |
+          set -uo pipefail
+          if ! command -v dvc >/dev/null 2>&1; then
+            echo "::warning title=DVC missing::dvc is not installed; skipping pull."
+            exit 0
+          fi
+          if ! dvc remote list | grep -q .; then
+            echo "::notice title=No DVC remote::skipping dvc pull."
+            exit 0
+          fi
+          if dvc pull --quiet; then
+            echo "dvc pull OK"
+          else
+            echo "::warning title=DVC pull failed::continuing with the data committed in the repo."
+          fi
+
+      - name: Resolve MLflow tracking store
+        id: mlflow
+        env:
+          MLFLOW_TRACKING_URI_SECRET: ${{ secrets.MLFLOW_TRACKING_URI }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MLFLOW_TRACKING_URI_SECRET:-}" ]; then
+            echo "MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI_SECRET}" >> "$GITHUB_ENV"
+            echo "mode=remote" >> "$GITHUB_OUTPUT"
+            echo "using the configured MLflow tracking server (registry comparisons are real)"
+          else
+            # sqlite is DB-backed, so the model registry API works -- but it is
+            # empty, so there is no incumbent to beat. Honest smoke mode.
+            echo "MLFLOW_TRACKING_URI=sqlite:///${GITHUB_WORKSPACE}/mlflow.db" >> "$GITHUB_ENV"
+            echo "mode=ephemeral-sqlite" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Ephemeral registry::MLFLOW_TRACKING_URI is not configured. Using an empty sqlite registry: the loop runs end to end but there is no production incumbent to compare against."
+          fi
+
+      - name: Preflight — retraining entry point present
+        run: |
+          set -euo pipefail
+          test -f models/retrain.py || {
+            echo "::error title=Missing models/retrain.py::This workflow drives 'python -m models.retrain'."
+            exit 1
+          }
+          python -c "import models.retrain" 2>/dev/null \
+            || echo "::warning title=Import check::models.retrain did not import cleanly on a bare check; continuing to the real invocation for the full traceback."
+
+      - name: Inject synthetic drift (demand shock)
+        id: inject
+        if: steps.inputs.outputs.inject == 'true'
+        # scripts/demo_self_heal.py is the Phase 6 demo driver. It is advisory here:
+        # if it is absent or its CLI differs, the retrain below still runs (with
+        # --force on scheduled runs), so a broken injector cannot silently cancel
+        # the retraining loop.
+        continue-on-error: true
+        env:
+          DATASET: ${{ steps.inputs.outputs.dataset }}
+        run: |
+          set -uo pipefail
+          if [ ! -f scripts/demo_self_heal.py ]; then
+            echo "::notice title=No injector::scripts/demo_self_heal.py not found; skipping synthetic drift injection."
+            exit 0
+          fi
+          python scripts/demo_self_heal.py --dataset "$DATASET" --inject-only \
+            || python scripts/demo_self_heal.py --dataset "$DATASET" \
+            || echo "::warning title=Injection failed::synthetic drift injection did not complete; the retrain step still runs."
+
+      - name: Retrain, evaluate on the fixed holdout, and gate against Production
+        id: retrain
+        env:
+          DATASET: ${{ steps.inputs.outputs.dataset }}
+          FORCE: ${{ steps.inputs.outputs.force }}
+          DRY_RUN: ${{ steps.inputs.outputs.dry_run }}
+          THRESHOLD: ${{ steps.inputs.outputs.threshold }}
+          MODEL_NAME: ${{ vars.MODEL_NAME || 'demand-forecasting-lgbm' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -uo pipefail
+          set -x
+          python -m models.retrain \
+            --dataset "$DATASET" \
+            --threshold "$THRESHOLD" \
+            $FORCE $DRY_RUN 2>&1 | tee retrain.log
+          CODE=${PIPESTATUS[0]}
+          set +x
+          echo "exit_code=${CODE}" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" -eq 0 ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "::error title=Retrain failed::python -m models.retrain exited ${CODE} (retrain failure or blocked promotion gate)."
+          fi
+          exit "$CODE"
+
+      - name: Integration tests against the retrained stack
+        # Marked-integration tests self-skip when services/artifacts are missing, so
+        # this is a real gate when the registry is configured and a no-op otherwise.
+        if: steps.retrain.outputs.status == 'success'
+        env:
+          MODEL_NAME: ${{ vars.MODEL_NAME || 'demand-forecasting-lgbm' }}
+        run: pytest -q -m integration
+
+      - name: Extract metrics diff
+        id: diff
+        if: always()
+        # models.retrain is expected to leave a JSON report behind; we search the
+        # usual locations rather than hard-coding one path, and fall back to the
+        # tail of the log so the notification is never empty.
+        run: |
+          set -uo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json, os, pathlib
+
+          candidates = []
+          for pattern in (
+              "reports/retrain*.json",
+              "models/retrain*.json",
+              "models/artifacts/retrain*.json",
+              "retrain_report.json",
+          ):
+              candidates.extend(glob.glob(pattern))
+
+          lines = ["## Retrain report", ""]
+          payload = None
+          if candidates:
+              path = max(candidates, key=lambda p: pathlib.Path(p).stat().st_mtime)
+              lines.append(f"source: `{path}`")
+              try:
+                  payload = json.loads(pathlib.Path(path).read_text())
+              except Exception as exc:
+                  lines.append(f"could not parse report: {exc}")
+
+          summary = ""
+          if isinstance(payload, dict):
+              lines += ["", "| field | value |", "|---|---|"]
+              for key, value in payload.items():
+                  if isinstance(value, (dict, list)):
+                      value = json.dumps(value)[:200]
+                  lines.append(f"| {key} | `{value}` |")
+              keys = ("candidate_metric", "production_metric", "metric", "promoted", "reason")
+              summary = " | ".join(
+                  f"{k}={payload[k]}" for k in keys if k in payload
+              )
+          else:
+              log = pathlib.Path("retrain.log")
+              tail = log.read_text(errors="replace").splitlines()[-25:] if log.exists() else []
+              if tail:
+                  lines += ["", "No JSON report found; tail of the retrain log:", "", "```"]
+                  lines += tail
+                  lines.append("```")
+                  summary = tail[-1][:300]
+              else:
+                  lines.append("No retrain report or log produced.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"summary={summary or 'no metrics reported'}\n")
+
+          print("\n".join(lines))
+          PY
+
+      - name: Upload retrain artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-${{ steps.inputs.outputs.dataset }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            retrain.log
+            models/leaderboard.md
+            models/leaderboard.json
+            reports/**
+            models/retrain*.json
+            models/artifacts/**/*.json
+
+  notify:
+    name: Notify
+    needs: retrain
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Job summary
+        run: |
+          {
+            echo "## Retrain run"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| trigger | ${{ needs.retrain.outputs.trigger }} |"
+            echo "| dataset | ${{ needs.retrain.outputs.dataset }} |"
+            echo "| registry | ${{ needs.retrain.outputs.registry_mode }} |"
+            echo "| result | ${{ needs.retrain.result }} (exit ${{ needs.retrain.outputs.retrain_exit }}) |"
+            echo "| metrics | ${{ needs.retrain.outputs.metrics_diff }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          RESULT="${{ needs.retrain.result }}"
+          case "$RESULT" in
+            success) ICON=":white_check_mark:" ;;
+            cancelled) ICON=":grey_question:" ;;
+            *) ICON=":x:" ;;
+          esac
+          export TEXT="${ICON} *Retrain ${RESULT}* — \`${{ github.repository }}\`\ntrigger: ${{ needs.retrain.outputs.trigger }} | dataset: ${{ needs.retrain.outputs.dataset }} | registry: ${{ needs.retrain.outputs.registry_mode }}\nmetrics: ${{ needs.retrain.outputs.metrics_diff }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run log>"
+          python - <<'PY'
+          import json, os, urllib.request
+          payload = json.dumps({"text": os.environ["TEXT"]}).encode()
+          req = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"], data=payload,
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print("slack:", resp.status)
+          except Exception as exc:  # a failed ping must not fail the workflow
+              print("slack notification failed:", exc)
+          PY

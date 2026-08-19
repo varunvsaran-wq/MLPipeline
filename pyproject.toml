@@ -38,12 +38,15 @@ models = [
     "xgboost>=2.0",
     "optuna>=3.6",
 ]
-# Deep model (Phase 4)
+# Deep model + ONNX inference (Phase 4)
 deep = [
     "torch>=2.2",
     "pytorch-forecasting>=1.0",
     "onnx>=1.16",
     "onnxruntime>=1.18",
+    # LightGBM -> ONNX converters
+    "skl2onnx>=1.16",
+    "onnxmltools>=1.12",
 ]
 # Serving (Phase 3)
 serving = [
@@ -52,6 +55,7 @@ serving = [
     "prometheus-client>=0.20",
     "psycopg2-binary>=2.9",
     "sqlalchemy>=2.0",
+    "joblib>=1.4",
 ]
 # Monitoring + dashboard (Phase 5)
 monitoring = [

@@ -1,9 +1,12 @@
-# Phase 0 stack: MLflow tracking server backed by Postgres.
-# Later phases add the FastAPI serving container and the Streamlit dashboard.
+# MLOps stack: MLflow tracking (Postgres-backed) + the FastAPI serving API.
+# The Streamlit dashboard lands in Phase 5.
 #
-#   docker compose up -d        # start MLflow UI at http://localhost:5000
+#   docker compose up -d        # MLflow UI :5000, forecast API :8000/docs
 #   docker compose down         # stop (data persists in the named volume)
 #   docker compose down -v      # stop and wipe Postgres + artifacts
+#
+# The API loads a model bundle from ./models/artifacts (build it on the host
+# first: `python -m serving.model_bundle --dataset avocado`).
 
 services:
   postgres:
@@ -55,6 +58,60 @@ services:
       retries: 10
       start_period: 20s
 
+  api:
+    build:
+      context: .
+      dockerfile: docker/serving.Dockerfile
+    container_name: mlops-api
+    restart: unless-stopped
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      SERVING_DATASET: ${SERVING_DATASET:-avocado}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      # Persist the prediction log outside the code tree (named volume below).
+      SERVING_DB_URI: sqlite:////app/state/predictions.db
+    ports:
+      - "8000:8000"
+    volumes:
+      # Bundle built on the host; prediction log persists in a named volume.
+      - ./models/artifacts:/app/models/artifacts:ro
+      - api-data:/app/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    container_name: mlops-dashboard
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      SERVING_DATASET: ${SERVING_DATASET:-avocado}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      # Same prediction log the API writes to (shared named volume).
+      SERVING_DB_URI: sqlite:////app/state/predictions.db
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./models/artifacts:/app/models/artifacts:ro
+      - api-data:/app/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
 volumes:
   postgres-data:
   mlflow-artifacts:
+  api-data:

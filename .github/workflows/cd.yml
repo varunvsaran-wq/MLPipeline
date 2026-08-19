@@ -1,0 +1,454 @@
+# Continuous deployment (Phase 6).
+#
+# Flow, on every merge to main:
+#
+#   verify (mirrors ci.yml: ruff + data validation + pytest)
+#     -> promotion-gate (models.promote must not block the release)
+#       -> build-push   (serving image -> GHCR, tagged with the commit SHA *and* latest)
+#         -> deploy     (record currently-deployed tag -> deploy SHA tag
+#                        -> /health x3 -> ROLLBACK to the recorded tag on any failure)
+#           -> report   (job summary + optional Slack ping)
+#
+# The commit SHA tag is the immutable, pinnable artifact: `latest` moves, the SHA
+# tag never does, which is what makes the rollback deterministic.
+#
+# ---------------------------------------------------------------------------
+# Secrets / variables this workflow reads (all optional except GITHUB_TOKEN,
+# which Actions provides automatically):
+#
+#   secrets.GITHUB_TOKEN       - built in; used to push to GHCR (needs packages: write).
+#   secrets.FLY_API_TOKEN      - Fly.io deploy token. UNSET => the deploy job
+#                                degrades to a clearly-logged skip instead of a
+#                                confusing red X on forks / unconfigured repos.
+#   vars.FLY_APP               - Fly application name (default: demand-forecasting-api).
+#   vars.DEPLOY_HEALTH_URL     - override the health URL (default https://<FLY_APP>.fly.dev/health).
+#   secrets.MLFLOW_TRACKING_URI- DB-backed MLflow tracking server or SQLite/Postgres URI.
+#                                The MLflow *model registry* does not work against a
+#                                file:// / mlruns store (models.registry raises
+#                                RegistryUnsupportedError), so when this is unset the
+#                                promotion gate reports SKIPPED rather than pretending
+#                                to have run.
+#   vars.MODEL_NAME            - registered model to gate on (default: demand-forecasting-lgbm).
+#   vars.PROMOTION_THRESHOLD   - relative improvement required (default: 0.01 = 1%).
+#   secrets.SLACK_WEBHOOK_URL  - optional; deploy/rollback notification.
+#
+# Render alternative: swap the `deploy` job's flyctl calls for
+# `curl -X POST https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys`
+# with `Authorization: Bearer $RENDER_API_KEY` and an `imagePath` body; the
+# previous-image lookup becomes `GET /v1/services/$RENDER_SERVICE_ID` ->
+# `.imagePath`. Fly is the implemented primary because the rollback is a single
+# idempotent `flyctl deploy --image <previous>`.
+# ---------------------------------------------------------------------------
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "MLflow run id of a candidate to push through the promotion gate (optional)"
+        required: false
+        default: ""
+      skip_deploy:
+        description: "Build and push the image but do not deploy"
+        type: boolean
+        required: false
+        default: false
+
+# One deploy at a time. Never cancel a deploy in flight: a half-finished deploy
+# that is cancelled cannot run its own rollback.
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  MODEL_NAME: ${{ vars.MODEL_NAME || 'demand-forecasting-lgbm' }}
+  PROMOTION_THRESHOLD: ${{ vars.PROMOTION_THRESHOLD || '0.01' }}
+  FLY_APP: ${{ vars.FLY_APP || 'demand-forecasting-api' }}
+
+jobs:
+  # ---------------------------------------------------------------- verify --
+  verify:
+    # Same gates as ci.yml's lint-and-test, re-run on the merge commit so a
+    # deploy is never based on a green PR that went stale behind main.
+    name: Verify (lint + validate + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev + serving dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,serving]"
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Data validation
+        run: python -m data.validation --dataset avocado
+
+      - name: Test (pytest)
+        run: pytest -q
+
+  # -------------------------------------------------------- promotion gate --
+  promotion-gate:
+    # models.promote exits non-zero when the candidate fails to beat Production;
+    # that exit code is what blocks the build. Without a DB-backed tracking URI
+    # the registry is unavailable, so we say so loudly and let the app-only
+    # deploy proceed rather than fabricating a verdict.
+    name: Promotion gate
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.gate.outputs.status }}
+      production_version: ${{ steps.gate.outputs.production_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Evaluate promotion gate
+        id: gate
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          CANDIDATE_RUN_ID: ${{ github.event.inputs.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${MLFLOW_TRACKING_URI:-}" ]; then
+            echo "::warning title=Promotion gate skipped::MLFLOW_TRACKING_URI is not configured."
+            echo "The MLflow model registry requires a DB-backed store (postgresql:// or"
+            echo "sqlite:///...); a file:// / mlruns store raises RegistryUnsupportedError."
+            echo "Deploying the serving image without a registry verdict."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "production_version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Which version is currently Production? Also proves the registry is reachable.
+          PROD_VERSION=$(python - <<'PY'
+          from models.registry import RegistryUnsupportedError, get_production_version
+          import os, sys
+          try:
+              mv = get_production_version(os.environ["MODEL_NAME"])
+          except RegistryUnsupportedError as exc:
+              print("", end="")
+              sys.stderr.write(f"registry unsupported: {exc}\n")
+              sys.exit(0)
+          print(mv.version if mv is not None else "", end="")
+          PY
+          )
+          echo "current Production version: ${PROD_VERSION:-<none>}"
+          echo "production_version=${PROD_VERSION}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${CANDIDATE_RUN_ID:-}" ]; then
+            echo "No candidate run id supplied; nothing new to gate."
+            echo "status=no-candidate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Non-zero here fails the job and the whole deploy chain -- by design.
+          python -m models.promote \
+            --model-name "$MODEL_NAME" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --threshold "$PROMOTION_THRESHOLD"
+          echo "status=promoted" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------ build/push --
+  build-push:
+    name: Build + push serving image (GHCR)
+    needs: [verify, promotion-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image coordinates
+        id: meta
+        run: |
+          set -euo pipefail
+          # GHCR requires an all-lowercase repository path.
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO}/demand-api"
+          SHA_TAG="${IMAGE}:${GITHUB_SHA}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image: ${IMAGE}"
+          echo "immutable tag: ${SHA_TAG}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/serving.Dockerfile
+          push: true
+          # SHA tag = the pinnable artifact used for deploy *and* rollback.
+          # latest  = convenience pointer for humans and docker-compose.
+          tags: |
+            ${{ steps.meta.outputs.sha_tag }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the pushed image
+        # Same assertion as ci.yml's docker-build-smoke, but against the exact
+        # artifact we are about to ship.
+        run: |
+          set -uo pipefail
+          docker run -d --name api -p 8000:8000 "${{ steps.meta.outputs.sha_tag }}"
+          echo "waiting for /health ..."
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "health OK"; docker rm -f api >/dev/null 2>&1 || true; exit 0
+            fi
+            sleep 2
+          done
+          echo "health check failed; container logs:"; docker logs api
+          docker rm -f api >/dev/null 2>&1 || true
+          exit 1
+
+  # ---------------------------------------------------------------- deploy --
+  deploy:
+    name: Deploy + health check (rollback on failure)
+    needs: build-push
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.result.outputs.outcome }}
+      deployed_image: ${{ steps.result.outputs.deployed_image }}
+      previous_image: ${{ steps.previous.outputs.previous_image }}
+    env:
+      NEW_IMAGE: ${{ needs.build-push.outputs.sha_tag }}
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deploy target configuration
+        id: config
+        run: |
+          set -uo pipefail
+          if [ "${{ github.event.inputs.skip_deploy }}" = "true" ]; then
+            echo "::notice title=Deploy skipped::skip_deploy input was set."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "::notice title=Deploy skipped::FLY_API_TOKEN is not configured for this repository."
+            echo "The image ${NEW_IMAGE} was built and pushed to GHCR and can be deployed manually:"
+            echo "  flyctl deploy --app ${FLY_APP} --image ${NEW_IMAGE}"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install flyctl
+        if: steps.config.outputs.configured == 'true'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Record currently deployed image (the rollback target)
+        id: previous
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          set -uo pipefail
+          # `flyctl image show --json` reports the image the app is running right
+          # now. That reference -- captured BEFORE we touch anything -- is the
+          # only thing the rollback step trusts.
+          PREV=$(flyctl image show --app "$FLY_APP" --json 2>/dev/null \
+                 | jq -r 'if type == "array" then .[0] else . end
+                          | select(.Repository != null)
+                          | "\(.Registry)/\(.Repository):\(.Tag)"' \
+                 | head -n1)
+          if [ -z "${PREV:-}" ] || [ "$PREV" = "null" ]; then
+            PREV="none"
+            echo "::warning title=No rollback target::Could not resolve a currently deployed image (first deploy?). A failed health check will fail the job but cannot roll back."
+          fi
+          echo "previous_image=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "previous (rollback target): ${PREV}"
+          echo "new image                 : ${NEW_IMAGE}"
+          {
+            echo "### Deploy"
+            echo ""
+            echo "| | image |"
+            echo "|---|---|"
+            echo "| previous (rollback target) | \`${PREV}\` |"
+            echo "| new | \`${NEW_IMAGE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy new image to Fly.io
+        id: deploy
+        if: steps.config.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          flyctl deploy --app "$FLY_APP" --image "$NEW_IMAGE" --strategy immediate --yes
+
+      - name: Post-deploy health check (3 consecutive passes required)
+        id: health
+        if: steps.config.outputs.configured == 'true'
+        env:
+          HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || '' }}
+        run: |
+          set -uo pipefail
+          URL="${HEALTH_URL:-https://${FLY_APP}.fly.dev/health}"
+          echo "probing ${URL}"
+          # Give the new machines a moment to come up before the first probe.
+          sleep 10
+          for attempt in 1 2 3; do
+            BODY=$(curl -fsS --max-time 10 "$URL" 2>&1) || BODY=""
+            if echo "$BODY" | grep -q '"status":"ok"'; then
+              echo "health check ${attempt}/3 OK"
+            else
+              echo "::error title=Health check failed::attempt ${attempt}/3 against ${URL} did not return status=ok"
+              echo "response: ${BODY:-<no response>}"
+              exit 1
+            fi
+            [ "$attempt" -lt 3 ] && sleep 15
+          done
+          echo "all 3 health checks passed"
+
+      # --------------------------------------------------------- ROLLBACK --
+      - name: Roll back to the previously pinned image
+        id: rollback
+        # Fires whenever the deploy *or* any of the three health checks failed,
+        # and only when we actually captured a previous image reference.
+        if: failure() && steps.config.outputs.configured == 'true' && steps.previous.outputs.previous_image != 'none' && steps.previous.outputs.previous_image != ''
+        env:
+          PREVIOUS_IMAGE: ${{ steps.previous.outputs.previous_image }}
+          HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || '' }}
+        run: |
+          set -uo pipefail
+          echo "::error title=Rolling back::${NEW_IMAGE} failed its post-deploy checks; restoring ${PREVIOUS_IMAGE}"
+          flyctl deploy --app "$FLY_APP" --image "$PREVIOUS_IMAGE" --strategy immediate --yes
+          ROLLBACK_DEPLOY=$?
+
+          URL="${HEALTH_URL:-https://${FLY_APP}.fly.dev/health}"
+          sleep 10
+          ROLLBACK_OK=0
+          for attempt in 1 2 3; do
+            if curl -fsS --max-time 10 "$URL" | grep -q '"status":"ok"'; then
+              echo "post-rollback health ${attempt}/3 OK"
+              ROLLBACK_OK=$((ROLLBACK_OK + 1))
+            else
+              echo "post-rollback health ${attempt}/3 FAILED"
+            fi
+            [ "$attempt" -lt 3 ] && sleep 10
+          done
+
+          {
+            echo ""
+            echo "### :rewind: Rollback executed"
+            echo ""
+            echo "- failed image: \`${NEW_IMAGE}\`"
+            echo "- restored image: \`${PREVIOUS_IMAGE}\`"
+            echo "- rollback deploy exit code: ${ROLLBACK_DEPLOY}"
+            echo "- post-rollback health passes: ${ROLLBACK_OK}/3"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ROLLBACK_OK" -lt 3 ] || [ "$ROLLBACK_DEPLOY" -ne 0 ]; then
+            echo "::error title=Rollback unhealthy::The previous image did not come back healthy. Manual intervention required."
+          else
+            echo "::notice title=Rollback healthy::${PREVIOUS_IMAGE} is serving again."
+          fi
+          # The deploy failed. Even a perfect rollback keeps this job red.
+          exit 1
+
+      - name: Record outcome
+        id: result
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.config.outputs.configured }}" != "true" ]; then
+            OUTCOME="skipped"
+          elif [ "${{ steps.health.outcome }}" = "success" ]; then
+            OUTCOME="deployed"
+          elif [ "${{ steps.rollback.outcome }}" = "failure" ] || [ "${{ steps.rollback.outcome }}" = "success" ]; then
+            OUTCOME="rolled-back"
+          else
+            OUTCOME="failed"
+          fi
+          echo "outcome=${OUTCOME}" >> "$GITHUB_OUTPUT"
+          echo "deployed_image=${NEW_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "deploy outcome: ${OUTCOME}"
+
+  # ---------------------------------------------------------------- report --
+  report:
+    name: Report
+    needs: [promotion-gate, build-push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the notify step's `if:` can test it (step-level env is not
+      # visible to that step's own condition).
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Job summary
+        run: |
+          {
+            echo "## CD result"
+            echo ""
+            echo "| stage | result |"
+            echo "|---|---|"
+            echo "| promotion gate | ${{ needs.promotion-gate.outputs.status || needs.promotion-gate.result }} |"
+            echo "| image | \`${{ needs.build-push.outputs.sha_tag }}\` |"
+            echo "| digest | \`${{ needs.build-push.outputs.digest }}\` |"
+            echo "| deploy | ${{ needs.deploy.outputs.outcome || needs.deploy.result }} |"
+            echo "| previous image | \`${{ needs.deploy.outputs.previous_image }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          set -uo pipefail
+          OUTCOME="${{ needs.deploy.outputs.outcome || needs.deploy.result }}"
+          case "$OUTCOME" in
+            deployed) ICON=":white_check_mark:" ;;
+            rolled-back) ICON=":rewind:" ;;
+            skipped) ICON=":grey_question:" ;;
+            *) ICON=":x:" ;;
+          esac
+          export TEXT="${ICON} *CD ${OUTCOME}* — \`${{ github.repository }}@${GITHUB_SHA:0:7}\`\nimage: \`${{ needs.build-push.outputs.sha_tag }}\`\nprevious: \`${{ needs.deploy.outputs.previous_image }}\`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run log>"
+          python - <<'PY'
+          import json, os, urllib.request
+          payload = json.dumps({"text": os.environ["TEXT"]}).encode()
+          req = urllib.request.Request(
+              os.environ["SLACK_WEBHOOK_URL"], data=payload,
+              headers={"Content-Type": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print("slack:", resp.status)
+          except Exception as exc:  # never fail the build on a notification
+              print("slack notification failed:", exc)
+          PY
+        continue-on-error: true
