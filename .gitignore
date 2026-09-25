@@ -24,6 +24,8 @@ mlartifacts/
 # are rebuilt/regenerated (not source), so keep them out of git.
 models/artifacts/
 serving/*.db
+# Demo launcher logs (scripts/run_demo.py)
+.demo-logs/
 # Local SQLite MLflow store (the demo / offline runs create this).
 mlflow.db
 *.db-journal

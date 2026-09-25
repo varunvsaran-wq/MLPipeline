@@ -383,3 +383,11 @@ def test_app_module_imports():
     import dashboard.app as app
 
     assert callable(app.main)
+
+
+def test_drift_events_table_maps_store_timestamp():
+    # monitoring.store rows carry ``recorded_at``; the table must not show it as empty.
+    table = dd.drift_events_table(
+        [{"signal_name": "psi:lag_1", "status": "red", "recorded_at": "2026-01-01T00:00:00"}]
+    )
+    assert table["created_at"].iloc[0] == "2026-01-01T00:00:00"

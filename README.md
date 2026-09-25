@@ -10,6 +10,18 @@ automated retraining) is the deliverable.
 > monitoring with an ops dashboard, and an automated retrain → promote → deploy
 > loop with rollback and A/B shadow traffic. See the [phase plan](#phase-plan).
 
+## Demo
+
+```bash
+pip install -e ".[dev,models,serving,monitoring]"
+python scripts/run_demo.py --fresh      # API :8000, ops dashboard :8501
+```
+
+Open <http://localhost:8501>, then in the sidebar click **Inject shock → retrain →
+promote** to watch the drift → retrain → promote loop run live. See
+[DEMO.md](DEMO.md) for setup, a 2–3 minute recording script, and what is real
+versus simulated.
+
 ---
 
 ## Architecture
@@ -91,7 +103,9 @@ models/        model families, evaluation, registry + promotion gate, retraining
 serving/       FastAPI app, model bundle, predictor, prediction log, shadow router
 monitoring/    drift signals (PSI / residual / rolling WMAPE) + event store
 dashboard/     Streamlit ops dashboard (data.py = pure logic, app.py = rendering)
-scripts/       demo_self_heal.py — the end-to-end drift→retrain→promote demo
+scripts/       run_demo.py        — one-command local demo (API + dashboard + traffic)
+                 demo_self_heal.py  — the end-to-end drift→retrain→promote demo
+                 generate_traffic.py — send forecast traffic to a running API
 docker/        service Dockerfiles (mlflow, serving, dashboard)
 .github/workflows/  ci.yml, cd.yml, retrain.yml
 tests/         pytest unit + integration suite

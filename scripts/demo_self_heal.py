@@ -1,6 +1,7 @@
 """Self-healing demo: a demand shock is detected, retrains the platform, promotes (Phase 6).
 
     python scripts/demo_self_heal.py [--dataset avocado] [--shock 1.6] [--weeks 40] [--keep]
+                                     [--record]
 
 This is the executable form of the Phase 6 acceptance criterion — *a simulated
 demand-shock injection is detected, triggers retraining, and promotes a new
@@ -39,6 +40,11 @@ The narrative in seven steps:
 6. Retrain every family on the shocked data, evaluate on the fixed holdout,
    pick the winner, and put it through the promotion gate.
 7. Show the registry transition, the metrics diff and the recorded event.
+
+With ``--record`` the drift and retraining events the demo produced are copied
+into the real prediction database (``SERVING_DB_URI``, else
+``serving/predictions.db``) once it finishes, so the ops dashboard's drift and
+retraining panels show the run. Nothing else leaves the temp workspace.
 
 Exit code 0 means a new model was promoted (acceptance met), 1 means the gate
 blocked it, 2 means the demo could not run.
@@ -209,6 +215,44 @@ def _restore_leaderboards(snapshot: dict[Path, str | None]) -> None:
             path.write_text(content, encoding="utf-8")
 
 
+def _publish_events(dataset: str, target_uri: str) -> tuple[int, int]:
+    """Copy this run's drift + retraining events from the temp DB into ``target_uri``.
+
+    Only the audit trail is copied. The replayed forecasts stay behind: they were
+    scored against a shocked copy of the data the dashboard never sees.
+    """
+    from monitoring import store as monitoring_store
+    from serving import store as serving_store
+
+    drift = monitoring_store.fetch_drift_events(dataset, limit=10_000)
+    retrains = monitoring_store.fetch_retraining_events(dataset, limit=10_000)
+
+    previous = os.environ["SERVING_DB_URI"]
+    os.environ["SERVING_DB_URI"] = target_uri
+    serving_store.reset_engine()
+    monitoring_store.reset_tables()
+    try:
+        for e in reversed(drift):  # oldest first, so ids keep their order
+            monitoring_store.record_drift_event(
+                dataset, e["signal_name"], e["value"], e["status"], e["detail"]
+            )
+        for e in reversed(retrains):
+            monitoring_store.record_retraining_event(
+                dataset,
+                e["triggered_by"],
+                e["before_metrics"],
+                e["after_metrics"],
+                e["promoted"],
+                model_version=e["model_version"],
+                notes=e["notes"],
+            )
+    finally:
+        os.environ["SERVING_DB_URI"] = previous
+        serving_store.reset_engine()
+        monitoring_store.reset_tables()
+    return len(drift), len(retrains)
+
+
 def _signal_table(signals: list[Any]) -> str:
     rows = [("signal", "value", "status", "threshold")]
     rows += [(s.name, f"{s.value:.4f}", s.status, f"{s.threshold:.4f}") for s in signals]
@@ -236,12 +280,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--max-series", type=int, default=DEFAULT_MAX_SERIES, help="Prophet series cap")
     p.add_argument("--keep", action="store_true", help="keep the temp workspace for inspection")
+    p.add_argument(
+        "--record",
+        action="store_true",
+        help="copy the drift/retraining events into the real prediction DB (for the dashboard)",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     workdir = Path(tempfile.mkdtemp(prefix=f"self-heal-{args.dataset}-"))
+
+    # Where --record publishes to: the DB the API and dashboard use.
+    from serving.store import _DEFAULT_DB
+
+    record_uri = os.environ.get("SERVING_DB_URI", _DEFAULT_DB)
 
     # Everything stateful is redirected into the temp workspace *before* the
     # project modules that read these settings are imported.
@@ -363,6 +417,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"retraining event #{event['id']}: promoted={event['promoted']}, "
                 f"wmape {event['before_metrics'].get('wmape'):.4f} -> "
                 f"{event['after_metrics'].get('wmape'):.4f}"
+            )
+        if args.record:
+            n_drift, n_retrain = _publish_events(args.dataset, record_uri)
+            say(
+                f"recorded {n_drift} drift + {n_retrain} retraining events to {record_uri} "
+                "(refresh the dashboard)"
             )
         print()
         if report.promoted:

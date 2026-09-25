@@ -1,7 +1,7 @@
-# MLOps stack: MLflow tracking (Postgres-backed) + the FastAPI serving API.
-# The Streamlit dashboard lands in Phase 5.
+# MLOps stack: MLflow tracking (Postgres-backed), the FastAPI serving API and the
+# Streamlit ops dashboard.
 #
-#   docker compose up -d        # MLflow UI :5000, forecast API :8000/docs
+#   docker compose up -d        # MLflow UI :5000, API :8000/docs, dashboard :8501
 #   docker compose down         # stop (data persists in the named volume)
 #   docker compose down -v      # stop and wipe Postgres + artifacts
 #

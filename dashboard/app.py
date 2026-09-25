@@ -8,9 +8,10 @@ the error growing, and when did we last retrain.
 The file is a rendering shell on purpose. Every number comes from
 :mod:`dashboard.data`, which is pure and unit-tested — Streamlit script bodies
 cannot be meaningfully asserted on, so nothing that could be wrong is allowed to
-live here. What remains is layout, caching, and the drift-injection control used
+live here. What remains is layout, caching, the drift-injection control used
 to demonstrate the Phase 5 acceptance criterion (shifted feature data must turn
-the drift status red).
+the drift status red), and a button that runs the Phase 6 self-heal demo
+(``scripts/demo_self_heal.py --record``) and streams its narration here.
 
 Run it with::
 
@@ -19,7 +20,12 @@ Run it with::
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -27,6 +33,8 @@ import streamlit as st
 
 from dashboard import data as dd
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEMO_SCRIPT = PROJECT_ROOT / "scripts" / "demo_self_heal.py"
 REFRESH_SECONDS = 60
 STATUS_COLOR = {"green": "#1a9850", "yellow": "#e6a700", "red": "#d73027", "unknown": "#888888"}
 STATUS_EMOJI = {"green": "🟢", "yellow": "🟡", "red": "🔴", "unknown": "⚪"}
@@ -111,8 +119,9 @@ def render_production_model(info: dict) -> None:
     cols[1].metric("Trained at", str(info["trained_at"])[:19] or "—")
     cols[2].metric("Series", info["series_count"])
     cols[3].metric("Features", info["feature_count"])
-    if info.get("registry"):
-        st.caption(f"Registry (Production): {info['registry']}")
+    registry = info.get("registry")
+    if registry:
+        st.caption(f"Registry (Production): {registry['name']} v{registry['version']}")
     metrics = dd.metrics_table(info["metrics"])
     if metrics.empty:
         st.info("No validation metrics recorded in the bundle.")
@@ -230,6 +239,91 @@ def render_retraining(dataset: str) -> None:
             st.dataframe(events, hide_index=True, width="stretch")
 
 
+# --- self-heal demo ---------------------------------------------------------
+
+
+def self_heal_blocker(dataset: str) -> str | None:
+    """Why the self-heal demo can't run from here, or ``None`` if it can.
+
+    The demo retrains every model family, so it needs the training stack and the
+    raw data — both absent from the lean dashboard image by design.
+    """
+    missing = [m for m in ("mlflow", "prophet", "lightgbm") if importlib.util.find_spec(m) is None]
+    if missing:
+        return f"training deps not installed here ({', '.join(missing)})"
+    try:
+        from config import DatasetConfig
+        from data import loader
+
+        raw = loader.RAW_DIR / DatasetConfig.load(dataset).raw_filename
+    except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
+        return f"dataset config unavailable: {exc}"
+    if not raw.exists():
+        return f"raw data missing at {raw} (run `dvc pull`)"
+    return None
+
+
+def run_self_heal(dataset: str, shock: float) -> int:
+    """Run the self-heal demo in a subprocess, streaming its narration into the page."""
+    cmd = [
+        sys.executable,
+        str(DEMO_SCRIPT),
+        "--dataset",
+        dataset,
+        "--shock",
+        f"{shock:g}",
+        "--record",
+    ]
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    lines: list[str] = []
+    with st.status(f"Self-heal demo: injecting a x{shock:g} demand shock...", expanded=True) as box:
+        output = st.empty()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            # Library warnings are noise in a live demo; the narration is what matters.
+            if "Warning" in line or line.lstrip().startswith("warnings.warn"):
+                continue
+            lines.append(line.rstrip())
+            output.code("\n".join(lines[-40:]), language=None)
+        code = proc.wait()
+        labels = {0: ("promoted a new model", "complete"), 1: ("gate blocked", "complete")}
+        label, state = labels.get(code, ("failed", "error"))
+        box.update(label=f"Self-heal demo: {label} (exit {code})", state=state, expanded=True)
+    return code
+
+
+def render_self_heal_controls(dataset: str) -> None:
+    st.header("Self-heal demo")
+    blocker = self_heal_blocker(dataset)
+    if blocker:
+        st.caption(
+            f"Unavailable here: {blocker}. Run it from a full local install instead: "
+            "`python scripts/demo_self_heal.py --record`"
+        )
+        return
+    shock = st.slider(
+        "Demand shock (×)",
+        0.5,
+        2.5,
+        1.6,
+        0.1,
+        help="Multiplies the target over the last 40 weeks of a copy of the data. "
+        "Near 1.0 the drift stays green and nothing retrains.",
+    )
+    if st.button("Inject shock → retrain → promote", type="primary"):
+        st.session_state["self_heal"] = {"shock": shock}
+
+
 # --- entry point ------------------------------------------------------------
 
 
@@ -252,6 +346,14 @@ def main() -> None:
         if st.button("Refresh data"):
             st.cache_data.clear()
             nonce = 1
+        st.divider()
+        render_self_heal_controls(dataset)
+
+    pending = st.session_state.pop("self_heal", None)
+    if pending:
+        run_self_heal(dataset, pending["shock"])
+        st.cache_data.clear()
+        st.info("Retraining history below now includes this run (panel 7).")
 
     info = dd.production_model_info(dataset, bundle=_bundle(dataset))
     now = datetime.now(UTC)

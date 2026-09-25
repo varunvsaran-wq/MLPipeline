@@ -100,24 +100,22 @@ def _empty(columns: Sequence[str]) -> pd.DataFrame:
 def _registry_info(dataset: str) -> dict[str, Any] | None:
     """Best-effort lookup of the registered Production version (guarded).
 
-    ``models.registry`` is built alongside this module and its exact surface is
-    not fixed yet, so we probe the plausible entry points and give up quietly.
+    Returns ``None`` whenever the registry can't answer: mlflow not installed
+    (the dashboard image), a file-based tracking store, or nothing in Production.
     """
     try:
-        from models import registry  # type: ignore[attr-defined]
+        from models.registry import get_production_version
     except Exception:
         return None
-    for attr in ("production_version", "get_production_version", "current_production"):
-        fn = getattr(registry, attr, None)
-        if callable(fn):
-            try:
-                info = fn(dataset)
-            except Exception:
-                return None
-            if info is None:
-                return None
-            return dict(info) if isinstance(info, Mapping) else {"version": str(info)}
-    return None
+    # Mirrors models.retrain.MODEL_NAME_TEMPLATE without importing the training stack.
+    name = f"demand-forecasting-{dataset}"
+    try:
+        version = get_production_version(name)
+    except Exception:
+        return None
+    if version is None:
+        return None
+    return {"name": name, "version": str(version.version), "run_id": version.run_id}
 
 
 def production_model_info(dataset: str | None = None, bundle: Any = None) -> dict[str, Any]:
@@ -689,6 +687,9 @@ def drift_events_table(
     if not rows:
         return _empty(columns)
     table = pd.DataFrame(rows)
+    # monitoring.store names the timestamp ``recorded_at``; show it as created_at.
+    if "recorded_at" in table.columns and "created_at" not in table.columns:
+        table["created_at"] = table["recorded_at"]
     for col in columns:
         if col not in table.columns:
             table[col] = None
