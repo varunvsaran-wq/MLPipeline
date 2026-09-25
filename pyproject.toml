@@ -21,6 +21,8 @@ dependencies = [
     "dvc>=3.50,<4.0",
     # Tracking / registry
     "mlflow>=2.13,<3.0",
+    # mlflow 2.x imports FallbackAsyncAdaptedQueuePool, which SQLAlchemy 2.1 removed.
+    "sqlalchemy>=2.0,<2.1",
     # Feature engineering
     "holidays>=0.50",
     "scikit-learn>=1.5,<2.0",
@@ -54,7 +56,7 @@ serving = [
     "uvicorn[standard]>=0.30",
     "prometheus-client>=0.20",
     "psycopg2-binary>=2.9",
-    "sqlalchemy>=2.0",
+    "sqlalchemy>=2.0,<2.1",
     "joblib>=1.4",
 ]
 # Monitoring + dashboard (Phase 5)

@@ -42,10 +42,10 @@
 name: Retrain
 
 on:
-  schedule:
-    # 03:17 UTC every Monday. Off-the-hour so it is not queued behind the
-    # thundering herd of :00 cron jobs on GitHub's shared runners.
-    - cron: "17 3 * * 1"
+  # The weekly cron is off while there is no live data or cloud DVC remote (the
+  # runner has no dataset to retrain on). To re-enable, restore:
+  #   schedule:
+  #     - cron: "17 3 * * 1"   # 03:17 UTC Mondays, off-the-hour on purpose
   repository_dispatch:
     types: [drift-breach]
   workflow_dispatch:

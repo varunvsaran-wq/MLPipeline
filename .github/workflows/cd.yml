@@ -1,6 +1,9 @@
 # Continuous deployment (Phase 6).
 #
-# Flow, on every merge to main:
+# Manual only (Actions -> CD -> Run workflow). The push-to-main trigger is off
+# while there is no live deployment; restore `push: branches: [main]` to re-enable.
+#
+# Flow:
 #
 #   verify (mirrors ci.yml: ruff + data validation + pytest)
 #     -> promotion-gate (models.promote must not block the release)
@@ -43,8 +46,6 @@
 name: CD
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       run_id:

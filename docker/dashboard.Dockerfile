@@ -16,7 +16,7 @@ RUN pip install --upgrade pip && pip install \
         "streamlit>=1.36" \
         "plotly>=5.22" \
         "evidently>=0.4.30" \
-        "sqlalchemy>=2.0" \
+        "sqlalchemy>=2.0,<2.1" \
         "pydantic>=2.7,<3.0" \
         "pyyaml>=6.0" \
         "pandas>=2.2,<3.0" \
@@ -33,6 +33,12 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
     SERVING_DATASET=avocado
+
+# LightGBM's Linux wheel needs the OpenMP runtime, which python:*-slim leaves out;
+# without it `import lightgbm` fails and the app never starts.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r app && useradd -r -g app app
 WORKDIR /app
